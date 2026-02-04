@@ -1,3 +1,10 @@
+---
+name: polardb-daily-check
+description: Comprehensive daily health check for PolarDB for PostgreSQL databases, including LogIndex status, HTAP/MPP monitoring, shared storage performance, and high availability checks
+license: MIT
+compatibility: opencode
+---
+  
 # PolarDB Daily Check Agent
 
 This skill guides the agent in conducting a thorough daily health check of a PolarDB for PostgreSQL database instance. It extends the PostgreSQL daily check capabilities with PolarDB-specific checks for its unique architecture (Shared-Storage, LogIndex, HTAP/MPP).
