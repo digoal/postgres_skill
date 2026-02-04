@@ -560,6 +560,289 @@ class PostgresAgent:
             else:
                 self.report.append("Table statistics appear to be up-to-date.")
 
+        elif skill == "get_io_statistics":
+            self.report.append("### 🟡 INFO: I/O Statistics")
+            if data:
+                io_stats = data[0]
+                temp_files = io_stats.get("temp_files", 0)
+                temp_bytes = io_stats.get("temp_bytes", 0)
+                blks_read = io_stats.get("blks_read", 0)
+                blks_hit = io_stats.get("blks_hit", 0)
+                total_blks = io_stats.get("total_blks", 0)
+                blk_read_time = io_stats.get("blk_read_time", 0)
+                blk_write_time = io_stats.get("blk_write_time", 0)
+
+                self.report.append(f"- **Temp Files:** {temp_files}")
+                self.report.append(
+                    f"- **Temp Bytes:** {io_stats.get('temp_bytes_pretty', 'N/A')}"
+                )
+                self.report.append(f"- **Blocks Read:** {blks_read:,}")
+                self.report.append(f"- **Blocks Hit:** {blks_hit:,}")
+                self.report.append(f"- **Total Blocks:** {total_blks:,}")
+                self.report.append(f"- **Read Time (ms):** {blk_read_time}")
+                self.report.append(f"- **Write Time (ms):** {blk_write_time}")
+
+                if temp_files > 100:
+                    self.report.append("### 🟠 WARNING: High Temp File Usage")
+                    self.report.append(
+                        "Large number of temp files may indicate inefficient queries or insufficient work_mem."
+                    )
+                    self._update_status("🟠 WARNING")
+            else:
+                self.report.append("Unable to retrieve I/O statistics.")
+
+        elif skill == "get_io_statistics_v2":
+            self.report.append("### 🟡 INFO: Extended I/O Statistics (pg_stat_io)")
+            if data:
+                self.report.append(
+                    "| Backend Type | Object | Context | Reads | Read Bytes | Writes | Write Bytes |"
+                )
+                self.report.append("|---|---|---|---|---|---|---|")
+                for item in data[:15]:
+                    backend = item.get("backend_type", "N/A")
+                    obj = item.get("object", "N/A")
+                    ctx = item.get("context", "N/A")
+                    reads = item.get("reads", 0) or 0
+                    writes = item.get("writes", 0) or 0
+                    read_bytes = item.get("read_bytes_pretty", "0 bytes")
+                    write_bytes = item.get("write_bytes_pretty", "0 bytes")
+                    self.report.append(
+                        f"| {backend} | {obj} | {ctx} | {reads:,} | {read_bytes} | {writes:,} | {write_bytes} |"
+                    )
+
+                client_backend = next(
+                    (
+                        x
+                        for x in data
+                        if x.get("backend_type") == "client backend"
+                        and x.get("object") == "relation"
+                    ),
+                    None,
+                )
+                if client_backend:
+                    hit_ratio = 0
+                    reads = client_backend.get("reads", 0) or 0
+                    hits = client_backend.get("hits", 0) or 0
+                    if reads > 0:
+                        hit_ratio = (hits / (reads + hits)) * 100
+                    self.report.append(f"\n**Client Backend Relation I/O:**")
+                    self.report.append(f"- Reads: {reads:,}, Hits: {hits:,}")
+                    self.report.append(f"- Hit Ratio: {hit_ratio:.2f}%")
+            else:
+                self.report.append(
+                    "No I/O statistics available (pg_stat_io may not be available in this PostgreSQL version)."
+                )
+
+        elif skill == "get_analyze_progress":
+            self.report.append("### 🟡 INFO: ANALYZE Progress")
+            if data:
+                for item in data:
+                    phase = item.get("phase", "unknown")
+                    progress_pct = item.get("scan_progress_pct", 0)
+                    self.report.append(
+                        f"- **PID {item.get('pid', 'N/A')}**: Analyzing `{item.get('relname', 'N/A')}` in `{item.get('datname', 'N/A')}`"
+                    )
+                    self.report.append(f"  - Phase: {phase}")
+                    self.report.append(
+                        f"  - Progress: {progress_pct}% ({item.get('sample_blks_scanned', 0)}/{item.get('sample_blks_total', 0)} blocks)"
+                    )
+                    if phase in [
+                        "acquiring sample rows",
+                        "acquiring inherited sample rows",
+                    ]:
+                        if (
+                            float(progress_pct or 0) < 5.0
+                            and item.get("delay_time", 0) > 60000
+                        ):
+                            self.report.append(
+                                "  - ⚠️ WARNING: ANALYZE may be throttled by vacuum_cost_delay"
+                            )
+                            self._update_status("🟠 WARNING")
+            else:
+                self.report.append("No ANALYZE operations currently running.")
+
+        elif skill == "get_create_index_progress":
+            self.report.append("### 🟡 INFO: CREATE INDEX / REINDEX Progress")
+            if data:
+                for item in data:
+                    phase = item.get("phase", "unknown")
+                    self.report.append(
+                        f"- **PID {item.get('pid', 'N/A')}**: Creating index `{item.get('index_name', 'N/A')}` on `{item.get('table_name', 'N/A')}`"
+                    )
+                    self.report.append(f"  - Command: {item.get('command', 'N/A')}")
+                    self.report.append(f"  - Phase: {phase}")
+                    self.report.append(
+                        f"  - Progress: {item.get('blks_done', 0)}/{item.get('blks_total', 0)} blocks, {item.get('tuples_done', 0)}/{item.get('tuples_total', 0)} tuples"
+                    )
+                    if "waiting for writers" in phase:
+                        self.report.append(
+                            "  - ⚠️ Waiting for other transactions to release locks"
+                        )
+            else:
+                self.report.append(
+                    "No CREATE INDEX or REINDEX operations currently running."
+                )
+
+        elif skill == "get_cluster_progress":
+            self.report.append("### 🟡 INFO: CLUSTER / VACUUM FULL Progress")
+            if data:
+                for item in data:
+                    phase = item.get("phase", "unknown")
+                    self.report.append(
+                        f"- **PID {item.get('pid', 'N/A')}**: Clustering `{item.get('relname', 'N/A')}` in `{item.get('datname', 'N/A')}`"
+                    )
+                    self.report.append(f"  - Command: {item.get('command', 'N/A')}")
+                    self.report.append(f"  - Phase: {phase}")
+                    self.report.append(
+                        f"  - Progress: {item.get('tuples_done', 0)}/{item.get('tuples_total', 0)} tuples"
+                    )
+                    if phase == "sorting tuples":
+                        if item.get("tuples_done", 0) == 0:
+                            self.report.append(
+                                "  - ⚠️ May indicate insufficient maintenance_work_mem"
+                            )
+            else:
+                self.report.append(
+                    "No CLUSTER or VACUUM FULL operations currently running."
+                )
+
+        elif skill == "get_wal_statistics":
+            self.report.append("### 🟡 INFO: WAL Statistics")
+            if data:
+                wal = data[0]
+                wal_buffers_full = wal.get("wal_buffers_full", 0)
+                self.report.append(f"- **WAL Records:** {wal.get('wal_records', 0):,}")
+                self.report.append(f"- **WAL FPI:** {wal.get('wal_fpi', 0):,}")
+                self.report.append(
+                    f"- **WAL Bytes:** {wal.get('wal_bytes_pretty', 'N/A')}"
+                )
+                self.report.append(f"- **Buffers Full:** {wal_buffers_full:,}")
+                self.report.append(f"- **Write Time:** {wal.get('wal_write', 0)} ms")
+                self.report.append(f"- **Sync Time:** {wal.get('wal_sync', 0)} ms")
+                if wal_buffers_full > 100:
+                    self.report.append("### 🟠 WARNING: High wal_buffers_full count")
+                    self.report.append(
+                        "Consider increasing wal_buffers or optimizing write workload."
+                    )
+                    self._update_status("🟠 WARNING")
+            else:
+                self.report.append("Unable to retrieve WAL statistics.")
+
+        elif skill == "get_checkpointer_stats":
+            self.report.append("### 🟡 INFO: Checkpointer Statistics")
+            if data:
+                cp = data[0]
+                timed = cp.get("checkpoints_timed", 0)
+                requested = cp.get("checkpoints_req", 0)
+                write_time = cp.get("checkpoint_write_time", 0)
+                sync_time = cp.get("checkpoint_sync_time", 0)
+                buffers_written = cp.get("buffers_written", 0)
+
+                self.report.append(f"- **Timed Checkpoints:** {timed}")
+                self.report.append(f"- **Requested Checkpoints:** {requested}")
+                self.report.append(f"- **Buffers Written:** {buffers_written:,}")
+                self.report.append(f"- **Write Time:** {write_time} ms")
+                self.report.append(f"- **Sync Time:** {sync_time} ms")
+
+                if requested > timed * 2:
+                    self.report.append(
+                        "### 🟠 WARNING: High ratio of requested checkpoints"
+                    )
+                    self.report.append(
+                        "Consider tuning max_wal_size or checkpoint_timeout."
+                    )
+                    self._update_status("🟠 WARNING")
+                if write_time > 10000 or sync_time > 10000:
+                    self.report.append("### 🟠 WARNING: High checkpoint I/O time")
+                    self.report.append(
+                        "Consider faster storage or tuning checkpoint segments."
+                    )
+                    self._update_status("🟠 WARNING")
+            else:
+                self.report.append("Unable to retrieve checkpointer statistics.")
+
+        elif skill == "get_slru_stats":
+            self.report.append("### 🟡 INFO: SLRU Cache Statistics")
+            if data:
+                self.report.append("| SLRU Name | Hits | Reads | Hit Ratio |")
+                self.report.append("|---|---|---|---|")
+                for item in data:
+                    hits = item.get("blks_hit", 0)
+                    reads = item.get("blks_read", 0)
+                    total = hits + reads
+                    hit_ratio = round(hits / total * 100, 2) if total > 0 else 0
+                    self.report.append(
+                        f"| {item.get('name', 'N/A')} | {hits:,} | {reads:,} | {hit_ratio}% |"
+                    )
+                    if hit_ratio < 90 and reads > 1000:
+                        self.report.append(
+                            f"  - ⚠️ Low hit ratio for {item.get('name', 'N/A')}"
+                        )
+            else:
+                self.report.append("No significant SLRU activity detected.")
+
+        elif skill == "get_database_conflict_stats":
+            self.report.append("### 🟡 INFO: Database Conflict Statistics (Standby)")
+            if data:
+                has_conflicts = False
+                for item in data:
+                    conflicts = item.get("conflict_all", 0)
+                    if conflicts > 0:
+                        has_conflicts = True
+                        self.report.append(
+                            f"- **{item.get('datname', 'N/A')}**: {conflicts:,} conflicts"
+                        )
+                        self.report.append(
+                            f"  - Tablespace: {item.get('conflict_tablespace', 0)}"
+                        )
+                        self.report.append(f"  - Lock: {item.get('conflict_lock', 0)}")
+                        self.report.append(
+                            f"  - Snapshot: {item.get('conflict_snapshot', 0)}"
+                        )
+                        self.report.append(
+                            f"  - Bufferpin: {item.get('conflict_bufferpin', 0)}"
+                        )
+                        self.report.append(
+                            f"  - Deadlock: {item.get('conflict_deadlock', 0)}"
+                        )
+                        if item.get("conflict_snapshot", 0) > 0:
+                            self.report.append(
+                                "  - ⚠️ Consider increasing hot_standby_feedback"
+                            )
+                if has_conflicts:
+                    self.report.append("### 🟠 WARNING: Standby conflicts detected")
+                    self.report.append(
+                        "Conflicts may indicate need to tune max_standby_streaming_delay"
+                    )
+                    self._update_status("🟠 WARNING")
+                else:
+                    self.report.append("No recovery conflicts detected.")
+            else:
+                self.report.append("No standby conflict statistics available.")
+
+        elif skill == "get_user_function_stats":
+            self.report.append("### 🟡 INFO: User Function Statistics")
+            if data:
+                self.report.append(
+                    "| Function | Calls | Total Time (ms) | Avg Time (ms) |"
+                )
+                self.report.append("|---|---|---|---|")
+                for item in data:
+                    self.report.append(
+                        f"| {item.get('schemaname', 'N/A')}.{item.get('funcname', 'N/A')} | {item.get('calls', 0):,} | {item.get('total_time', 0):.2f} | {item.get('avg_time_ms', 0):.2f} |"
+                    )
+                self.report.append("")
+                self.report.append("Top time-consuming functions:")
+                for i, item in enumerate(data[:3]):
+                    if float(item.get("total_time", 0)) > 1000:
+                        self.report.append(
+                            f"  {i + 1}. {item.get('schemaname', 'N/A')}.{item.get('funcname', 'N/A')}: {item.get('total_time', 0):.2f} ms total"
+                        )
+            else:
+                self.report.append(
+                    "No user function statistics available (track_functions may be off)."
+                )
+
         elif skill == "get_bgwriter_stats":
             self.report.append("### 🟡 INFO: Background Writer Statistics")
             if data:
@@ -660,6 +943,15 @@ class PostgresAgent:
             "get_bgwriter_stats",
             "get_temp_file_usage",
             "get_io_statistics",
+            "get_io_statistics_v2",
+            "get_analyze_progress",
+            "get_create_index_progress",
+            "get_cluster_progress",
+            "get_wal_statistics",
+            "get_checkpointer_stats",
+            "get_slru_stats",
+            "get_database_conflict_stats",
+            "get_user_function_stats",
             "get_deadlock_detection",
             "get_lock_waiters",
             "get_table_hotspots",
