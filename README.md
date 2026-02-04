@@ -1,2 +1,2 @@
 # postgres_skill
-PostgreSQL health detection SKILL for AI Agent
+PostgreSQL SKILLs for AI Agent.
