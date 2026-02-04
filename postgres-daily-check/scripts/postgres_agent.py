@@ -1,0 +1,703 @@
+# -*- coding: utf-8 -*-
+import json
+import subprocess
+import datetime
+import os
+
+# =================================================================
+# PostgreSQL Daily Check AI Agent
+# =================================================================
+# This agent orchestrates the daily health check of a PostgreSQL database.
+# 1. It defines a list of checks (skills) to be performed.
+# 2. It executes each check by calling the `run_postgres_check.sh` script.
+# 3. It analyzes the JSON output from the script.
+# 4. It generates a human-readable summary report in Markdown format.
+# =================================================================
+
+
+class PostgresAgent:
+    """
+    The core logic for the PostgreSQL monitoring agent.
+    """
+
+    def __init__(self, executor_script="run_postgres_check.sh"):
+        self.executor_script = os.path.join(os.path.dirname(__file__), executor_script)
+        self.report = []
+        self.report_status = "✅ OK"
+
+    def _bytes_to_human_readable(self, num_bytes):
+        """Converts bytes to human-readable format (e.g., KB, MB, GB)."""
+        if num_bytes is None:
+            return "N/A"
+        num_bytes = float(num_bytes)
+        for unit in ["bytes", "KB", "MB", "GB", "TB"]:
+            if abs(num_bytes) < 1024.0:
+                return f"{num_bytes:.2f} {unit}"
+            num_bytes /= 1024.0
+        return f"{num_bytes:.2f} PB"
+
+    def _run_skill(self, skill_name, params=None):
+        """
+        Executes a skill using the shell script and returns the parsed JSON output.
+        """
+        command = [self.executor_script, skill_name]
+        if params:
+            command.extend(params)
+
+        try:
+            if not os.access(self.executor_script, os.X_OK):
+                os.chmod(self.executor_script, 0o755)
+
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=900,
+                env=os.environ,
+            )
+
+            if process.returncode != 0:
+                if "does not exist" in process.stderr:
+                    return {
+                        "skill": skill_name,
+                        "status": "success",
+                        "data": [],
+                        "notes": f"view or table does not exist: {process.stderr}",
+                    }
+                return {
+                    "skill": skill_name,
+                    "status": "fail",
+                    "data": f"Script execution failed with code {process.returncode}: {process.stderr}",
+                }
+
+            if not process.stdout.strip():
+                return {"skill": skill_name, "status": "success", "data": []}
+
+            return json.loads(process.stdout)
+        except json.JSONDecodeError as e:
+            return {
+                "skill": skill_name,
+                "status": "fail",
+                "data": f"Failed to parse JSON output: {e}. Raw output: {process.stdout}",
+            }
+        except Exception as e:
+            return {
+                "skill": skill_name,
+                "status": "fail",
+                "data": f"An unexpected error occurred: {e}",
+            }
+
+    def _update_status(self, new_status):
+        """Helper to safely elevate the report status."""
+        if new_status == "❌ ERROR":
+            self.report_status = "❌ ERROR"
+        elif new_status == "🟠 WARNING" and self.report_status != "❌ ERROR":
+            self.report_status = "🟠 WARNING"
+
+    def _analyze_and_report(self, result):
+        """
+        Analyzes the result of a skill and adds findings to the report.
+        """
+        skill = result.get("skill", "unknown_skill")
+        status = result.get("status", "fail")
+        data = result.get("data", [])
+        notes = result.get("notes", "")
+
+        if status != "success":
+            self.report.append(f"### ❌ Skill Failed: `{skill}`")
+            self.report.append(f"Error details: `{data}`")
+            self._update_status("❌ ERROR")
+            return
+
+        # --- Analysis Logic ---
+        if skill == "get_blocking_locks":
+            if data:
+                self.report.append("### ❌ ERROR: Blocking Locks Detected")
+                self.report.append(f"Found {len(data)} blocking lock situations.")
+                for lock in data:
+                    self.report.append(
+                        f"- **Waiting PID:** {lock['waiting_pid']} is blocked by **Blocking PID:** {lock['blocking_pid']}."
+                    )
+                self._update_status("❌ ERROR")
+            else:
+                self.report.append("### ✅ OK: No Blocking Locks")
+
+        elif skill == "get_top_sql_by_time":
+            self.report.append("### 🟡 INFO: Top 5 Queries by Total Execution Time")
+            if data:
+                self.report.append("| Total Mins | Avg ms | Calls | Query |")
+                self.report.append("|---|---|---|---|")
+                for item in data:
+                    query_text = (
+                        item["query"].replace("\n", " ").replace("\r", "")[:80] + "..."
+                    )
+                    self.report.append(
+                        f"| {item['total_minutes']} | {item['avg_ms']} | {item['calls']} | `{query_text}` |"
+                    )
+            elif "does not exist" in notes:
+                self.report.append(
+                    "`pg_stat_statements` extension is not installed or available."
+                )
+            else:
+                self.report.append("Could not retrieve Top SQL data.")
+
+        elif skill == "get_top_objects_by_size":
+            self.report.append("### 🟡 INFO: Top 5 Largest Objects")
+            if data:
+                self.report.append("| Type | Schema | Name | Size |")
+                self.report.append("|---|---|---|---|")
+                for item in data:
+                    self.report.append(
+                        f"| {item['type']} | {item['schemaname']} | {item['object_name']} | {item['size']} |"
+                    )
+            else:
+                self.report.append("Could not retrieve object size data.")
+
+        elif skill == "get_table_hotspots":
+            self.report.append("### 🟡 INFO: Top 5 Table Hotspots (by DMLs & Scans)")
+            if data:
+                self.report.append(
+                    "| Schema | Table | Total DMLs | Total Scans | Dead Tuples |"
+                )
+                self.report.append("|---|---|---|---|---|")
+                for item in data:
+                    self.report.append(
+                        f"| {item['schemaname']} | {item['relname']} | {item['total_dml']} | {item['total_scans']} | {item['n_dead_tup']} |"
+                    )
+            else:
+                self.report.append("Could not retrieve table hotspot data.")
+
+        elif skill == "get_wal_archiver_status":
+            self.report.append("### 🟡 INFO: WAL & Archiver Status")
+            if data:
+                status = data[0]
+                if status["failed_count"] > 0:
+                    self.report.append(f"### ❌ ERROR: Archiver has Failed")
+                    self.report.append(f"- **Failed Count:** {status['failed_count']}")
+                    self.report.append(
+                        f"- **Last Failed WAL:** `{status['last_failed_wal']}` at `{status['last_failed_time']}`"
+                    )
+                    self._update_status("❌ ERROR")
+                else:
+                    self.report.append("### ✅ OK: Archiver Status")
+
+                self.report.append(
+                    f"- **WAL Directory Size:** {status['wal_directory_size']}"
+                )
+                self.report.append(
+                    f"- **Last Archived WAL:** `{status['last_archived_wal']}` at `{status['last_archived_time']}`"
+                )
+            elif "does not exist" in notes:
+                self.report.append(
+                    "Archiving may be disabled (`archive_mode` is likely off)."
+                )
+            else:
+                self.report.append("Could not retrieve archiver status.")
+
+        elif skill == "get_large_unused_indexes":
+            self.report.append("### 🟡 INFO: Large Unused Indexes (>10MB)")
+            if data:
+                self.report.append(
+                    f"Found {len(data)} large indexes that have not been scanned. These are candidates for removal, but require careful analysis."
+                )
+                self.report.append("| Table | Index | Size |")
+                self.report.append("|---|---|---|")
+                for item in data:
+                    self.report.append(
+                        f"| `{item['schemaname']}.{item['table_name']}` | `{item['index_name']}` | {item['index_size']} |"
+                    )
+                self._update_status("🟠 WARNING")
+            else:
+                self.report.append("No large, unused indexes were found.")
+
+        # --- Bloat Reports ---
+        elif skill == "get_table_bloat" or skill == "get_index_bloat":
+            obj_type = "Table" if skill == "get_table_bloat" else "Index"
+            self.report.append(f"### 🟡 INFO: Top 10 Bloated {obj_type}s")
+            if data:
+                has_bloat_warning = False
+                self.report.append(
+                    f"| Schema | {obj_type} Name | Total Size | Bloat % | Wasted Space |"
+                )
+                self.report.append("|---|---|---|---|---|")
+                for item in data:
+                    bloat_pct = float(item.get("bloat_percentage", 0))
+                    wasted_bytes = float(item.get("wasted_bytes", 0))
+                    total_bytes = float(item.get("total_bytes", 0))
+
+                    if bloat_pct > 20 and wasted_bytes > 100 * (
+                        1024**2
+                    ):  # 20% bloat and > 100MB wasted
+                        has_bloat_warning = True
+                    self.report.append(
+                        f"| {item.get('schemaname', 'N/A')} | `{item.get('tablename', item.get('index_name', 'N/A'))}` | {self._bytes_to_human_readable(total_bytes)} | {bloat_pct:.2f}% | {self._bytes_to_human_readable(wasted_bytes)} |"
+                    )
+                if has_bloat_warning:
+                    # Adjust the previous INFO header to WARNING
+                    self.report[len(self.report) - len(data) - 2] = (
+                        f"### 🟠 WARNING: Significant {obj_type} Bloat Detected"
+                    )
+                    self._update_status("🟠 WARNING")
+            else:
+                self.report.append(
+                    f"No significant {obj_type.lower()} bloat detected (or objects are too small/new to check)."
+                )
+
+        # --- Other existing skills ---
+        elif skill == "get_long_running_queries":
+            if data:
+                self.report.append("### 🟠 WARNING: Long-Running Queries Detected")
+                self.report.append(
+                    f"Found {len(data)} queries running longer than the threshold."
+                )
+                for q in data:
+                    self.report.append(
+                        f"- **PID:** {q['pid']}, **User:** {q['usename']}, **Duration:** {q['duration']}"
+                    )
+                self._update_status("🟠 WARNING")
+            else:
+                self.report.append("### ✅ OK: No Long-Running Queries")
+
+        elif skill == "get_idle_in_transaction_sessions":
+            if data:
+                self.report.append(
+                    "### 🟠 WARNING: Idle-in-Transaction Sessions Detected"
+                )
+                self.report.append(
+                    f"Found {len(data)} sessions idle in transaction longer than the threshold."
+                )
+                for s in data:
+                    self.report.append(
+                        f"- **PID:** {s['pid']}, **User:** {s['usename']}, **Duration:** {s['transaction_duration']}"
+                    )
+                self._update_status("🟠 WARNING")
+            else:
+                self.report.append("### ✅ OK: No Idle-in-Transaction Sessions")
+
+        elif skill == "get_connection_usage":
+            if data:
+                used = data[0]["used_connections"]
+                max_conn = data[0]["max_connections"]
+                usage_percent = (used / max_conn) * 100
+
+                if usage_percent > 95:
+                    self.report.append(
+                        f"### ❌ ERROR: High Connection Usage ({usage_percent:.1f}%)"
+                    )
+                    self._update_status("❌ ERROR")
+                elif usage_percent > 80:
+                    self.report.append(
+                        f"### 🟠 WARNING: High Connection Usage ({usage_percent:.1f}%)"
+                    )
+                    self._update_status("🟠 WARNING")
+                else:
+                    self.report.append(
+                        f"### ✅ OK: Connection Usage ({usage_percent:.1f}%)"
+                    )
+                self.report.append(f"Current active connections: {used} / {max_conn}")
+            else:
+                self.report.append("### 🟡 INFO: Connection Usage")
+
+        elif skill == "get_cache_hit_rate":
+            if data:
+                hit_rate = float(data[0].get("hit_rate_percentage", 0))
+                db_name = data[0].get("datname", "N/A")
+                if hit_rate < 99.0:
+                    self.report.append(
+                        f"### 🟠 WARNING: Low Cache Hit Rate for '{db_name}' ({hit_rate}%)"
+                    )
+                    self._update_status("🟠 WARNING")
+                else:
+                    self.report.append(
+                        f"### ✅ OK: Cache Hit Rate for '{db_name}' ({hit_rate}%)"
+                    )
+            else:
+                self.report.append("### 🟡 INFO: Cache Hit Rate")
+
+        elif skill == "get_xid_wraparound_risk":
+            self.report.append("### 🟡 INFO: Transaction ID Wraparound Risk")
+            has_risk = False
+            for db in data:
+                age = db.get("xid_age", 0)
+                percent = db.get("percentage_used", 0)
+                if age > 1_800_000_000:  # ~85%
+                    self.report.append(
+                        f"- **{db['datname']}**: ❌ **CRITICAL** - {percent}% used ({age:,} transactions old)"
+                    )
+                    has_risk = True
+                    self._update_status("❌ ERROR")
+                elif age > 1_500_000_000:  # ~70%
+                    self.report.append(
+                        f"- **{db['datname']}:** 🟠 **WARNING** - {percent}% used ({age:,} transactions old)"
+                    )
+                    has_risk = True
+                    self._update_status("🟠 WARNING")
+            if not has_risk:
+                self.report.append(
+                    "All databases are well below the wraparound threshold."
+                )
+
+        elif skill == "get_invalid_indexes":
+            if data:
+                self.report.append("### ❌ ERROR: Invalid Indexes Found")
+                self.report.append(
+                    "These indexes are unusable and may block DML. Recreate them with `REINDEX` or drop and create them again."
+                )
+                for idx in data:
+                    self.report.append(f"- `{idx['schema_name']}.{idx['index_name']}`")
+                self._update_status("❌ ERROR")
+            else:
+                self.report.append("### ✅ OK: No Invalid Indexes")
+
+        elif skill == "get_rollback_rate":
+            self.report.append("### 🟡 INFO: Transaction Rollback Rate")
+            has_high_rate = False
+            if data:
+                for db in data:
+                    rate = float(db.get("rollback_percentage", 0))
+                    if rate > 5:
+                        self.report.append(
+                            f"- **{db['datname']}**: 🟠 **WARNING** - Rollback rate is {rate}%. High rollbacks can indicate application logic issues."
+                        )
+                        has_high_rate = True
+                        self._update_status("🟠 WARNING")
+            if not has_high_rate:
+                self.report.append(
+                    "Transaction rollback rates are within normal limits."
+                )
+
+        elif skill == "get_replication_slots":
+            self.report.append("### 🟡 INFO: Replication Slots Status")
+            if not data and result.get("notes") != "view or table does not exist":
+                self.report.append("No replication slots found.")
+            elif data:
+                has_issue = False
+                for slot in data:
+                    if not slot["active"]:
+                        lag_gb = slot["restart_lsn_lag_bytes"] / (1024**3)
+                        self.report.append(
+                            f"- **{slot['slot_name']}**: ❌ **ERROR** - Slot is INACTIVE, holding back WAL logs by {lag_gb:.2f} GB."
+                        )
+                        has_issue = True
+                        self._update_status("❌ ERROR")
+                if not has_issue:
+                    self.report.append("All replication slots are active.")
+            elif "does not exist" in notes:
+                self.report.append(
+                    "Replication slots are not applicable or view does not exist."
+                )
+
+        elif skill == "get_autovacuum_status":
+            self.report.append("### 🟡 INFO: Autovacuum Worker Status")
+            if data:
+                self.report.append("Found running autovacuum processes:")
+                for av in data:
+                    duration_str = av.get("duration", "N/A")
+                    self.report.append(
+                        f"- **PID {av['pid']}**: Running on db `{av['datname']}` for {duration_str}."
+                    )
+            else:
+                self.report.append("No autovacuum workers are currently active.")
+
+        elif skill == "get_replication_status":
+            self.report.append("### 🟡 INFO: Replication Status")
+            if not data:
+                self.report.append(
+                    "No active replicas found (normal for a standalone instance)."
+                )
+            else:
+                has_lag = False
+                for replica in data:
+                    lag_mb = replica.get("replay_lag_bytes", 0) / (1024**2)
+                    self.report.append(
+                        f"- **Replica:** `{replica.get('client_addr', 'N/A')}`, **State:** `{replica.get('state')}`, **Replay Lag:** `{lag_mb:.2f} MB`"
+                    )
+                    if lag_mb > 1024:  # Threshold: 1 GB
+                        has_lag = True
+                        self._update_status("❌ ERROR")
+                    elif lag_mb > 100:  # Threshold: 100 MB
+                        has_lag = True
+                        self._update_status("🟠 WARNING")
+                if has_lag:
+                    self.report[-len(data) - 1] = (
+                        "### 🟠 WARNING: Replication Lag Detected"
+                    )
+
+        elif skill == "get_database_sizes":
+            self.report.append("### 🟡 INFO: Top 10 Database Sizes")
+            if data:
+                self.report.append("| Database Name | Size |")
+                self.report.append("|---|---|")
+                for db in data:
+                    self.report.append(f"| {db['datname']} | {db['size']} |")
+            else:
+                self.report.append("Could not retrieve database sizes.")
+
+        elif skill == "get_freeze_prediction":
+            self.report.append(
+                "### 🟡 INFO: Freeze Storm Prediction (XID/MXID Wraparound)"
+            )
+            if data:
+                has_critical = False
+                has_warning = False
+                self.report.append(
+                    "| Schema | Table Name | Total Size | XID Remain | MXID Remain | Status |"
+                )
+                self.report.append("|---|---|---|---|---|---|")
+                for item in data:
+                    status = item["freeze_status"]
+                    if status == "CRITICAL" or status.endswith("_OVERDUE"):
+                        has_critical = True
+                    elif status == "WARNING":
+                        has_warning = True
+                    mxid_remain = item.get("mxid_remain_ages")
+                    mxid_str = str(mxid_remain) if mxid_remain is not None else "N/A"
+                    self.report.append(
+                        f"| {item['schemaname']} | `{item['table_name']}` | {item['total_size']} | {item['xid_remain_ages']:,} | {mxid_str} | **{status}** |"
+                    )
+
+                if has_critical:
+                    self.report[len(self.report) - len(data) - 2] = (
+                        "### ❌ ERROR: Critical Freeze Storm Risk Detected!"
+                    )
+                    self._update_status("❌ ERROR")
+                elif has_warning:
+                    self.report[len(self.report) - len(data) - 2] = (
+                        "### 🟠 WARNING: Freeze Storm Risk Detected"
+                    )
+                    self._update_status("🟠 WARNING")
+            else:
+                self.report.append(
+                    "No tables are currently approaching XID/MXID freeze limits."
+                )
+
+        # --- New Skills Analysis ---
+        elif skill == "get_critical_settings":
+            self.report.append("### 🟡 INFO: Critical Settings Review")
+            if data:
+                has_critical = False
+                self.report.append("| Setting | Value | Recommendation |")
+                self.report.append("|---|---|---|")
+                for item in data:
+                    setting_name = item["name"]
+                    setting_value = item["setting"]
+                    recommendation = "OK"
+                    if setting_name == "fsync" and setting_value != "on":
+                        recommendation = (
+                            "❌ **CRITICAL!** Data loss risk. Should be 'on'."
+                        )
+                        has_critical = True
+                        self._update_status("❌ ERROR")
+                    elif setting_name == "synchronous_commit" and setting_value not in (
+                        "on",
+                        "local",
+                    ):
+                        recommendation = "🟠 **WARNING!** Potential data loss on crash. Default is 'on'."
+                        self._update_status("🟠 WARNING")
+                    self.report.append(
+                        f"| `{setting_name}` | `{setting_value}` | {recommendation} |"
+                    )
+                if has_critical:
+                    self.report[len(self.report) - len(data) - 2] = (
+                        "### ❌ ERROR: Critical Settings Misconfiguration"
+                    )
+            else:
+                self.report.append("Could not retrieve critical settings information.")
+
+        elif skill == "get_sequence_exhaustion":
+            self.report.append("### 🟡 INFO: Sequence Exhaustion Risk")
+            if data:
+                self.report.append("### 🟠 WARNING: Sequences Approaching Max Value")
+                self.report.append(
+                    "The following sequences are over 80% used. Consider changing to a BIGINT or resetting if appropriate."
+                )
+                self.report.append("| Schema | Sequence Name | Percentage Used |")
+                self.report.append("|---|---|---|")
+                for item in data:
+                    self.report.append(
+                        f"| {item['schemaname']} | `{item['sequence_name']}` | {item['percentage_used']}% |"
+                    )
+                self._update_status("🟠 WARNING")
+            else:
+                self.report.append(
+                    "No sequences are nearing their exhaustion threshold."
+                )
+
+        elif skill == "get_wait_events":
+            self.report.append("### 🟡 INFO: Top 10 Current Wait Events")
+            if data:
+                self.report.append(
+                    "Shows what active sessions are waiting for right now. Useful for diagnosing bottlenecks."
+                )
+                self.report.append("| Wait Event Type | Wait Event | Occurrences |")
+                self.report.append("|---|---|---|")
+                for item in data:
+                    self.report.append(
+                        f"| {item['wait_event_type']} | `{item['wait_event']}` | {item['occurrences']} |"
+                    )
+            else:
+                self.report.append(
+                    "No significant wait events detected at this moment."
+                )
+
+        elif skill == "get_stale_statistics":
+            self.report.append("### 🟡 INFO: Stale Table Statistics")
+            if data:
+                self.report.append("### 🟠 WARNING: Tables with Stale Statistics Found")
+                self.report.append(
+                    "The following tables have had >10% of their rows modified since the last ANALYZE. Outdated stats can lead to poor query plans."
+                )
+                self.report.append(
+                    "| Schema | Table Name | Live Tuples | Modified % | Last Auto-Analyze |"
+                )
+                self.report.append("|---|---|---|---|---|")
+                for item in data:
+                    self.report.append(
+                        f"| {item['schemaname']} | `{item['relname']}` | {item['n_live_tup']:,} | {item['modified_percent']}% | {item['last_autoanalyze']} |"
+                    )
+                self._update_status("🟠 WARNING")
+            else:
+                self.report.append("Table statistics appear to be up-to-date.")
+
+        elif skill == "get_bgwriter_stats":
+            self.report.append("### 🟡 INFO: Background Writer Statistics")
+            if data:
+                bgwriter = data[0]
+                maxwritten = bgwriter.get("maxwritten_clean", 0)
+                if maxwritten > 0:
+                    self.report.append("### 🟠 WARNING: Background Writer Maxwritten")
+                    self.report.append(
+                        f"Background writer reached max pages limit {maxwritten} times. Consider tuning bgwriter parameters."
+                    )
+                    self._update_status("🟠 WARNING")
+                else:
+                    self.report.append("### ✅ OK: Background Writer Normal")
+                self.report.append(
+                    f"- **Buffers Clean:** {bgwriter.get('buffers_clean', 0)}"
+                )
+                self.report.append(
+                    f"- **Buffers Allocated:** {bgwriter.get('buffers_alloc', 0)}"
+                )
+                self.report.append(f"- **Maxwritten Clean:** {maxwritten}")
+
+        elif skill == "get_deadlock_detection":
+            self.report.append("### 🟡 INFO: Deadlock Detection")
+            if data:
+                deadlock_info = data[0]
+                deadlock_count = deadlock_info.get("deadlock_count", 0)
+                if deadlock_count > 0:
+                    self.report.append("### ❌ ERROR: Deadlocks Detected!")
+                    self.report.append(f"- **Total Deadlocks:** {deadlock_count}")
+                    self.report.append(
+                        "Deadlocks have occurred. Check PostgreSQL logs for details."
+                    )
+                    self._update_status("❌ ERROR")
+                else:
+                    self.report.append("### ✅ OK: No Deadlocks Detected")
+                    self.report.append(f"- **Deadlock Count:** {deadlock_count}")
+            else:
+                self.report.append("Unable to retrieve deadlock statistics.")
+
+        elif skill == "get_lock_waiters":
+            self.report.append("### 🟡 INFO: Lock Waiters (Potential Deadlock Risk)")
+            if data:
+                if len(data) > 5:
+                    self.report.append("### 🟠 WARNING: Multiple Lock Waiters Detected")
+                    self.report.append(
+                        f"Found {len(data)} sessions waiting for locks. This may indicate potential deadlock risks."
+                    )
+                    self._update_status("🟠 WARNING")
+                else:
+                    self.report.append("### ✅ OK: Few Lock Waiters")
+                self.report.append(
+                    "| Blocked PID | Blocked User | Blocked Query | Blocking PID | Blocking User | Blocked Mode | Relation |"
+                )
+                self.report.append("|---|---|---|---|---|---|---|")
+                for item in data:
+                    blocked_query = str(item.get("blocked_query", ""))[:60].replace(
+                        "\n", " "
+                    )
+                    blocking_query = str(item.get("blocking_query", ""))[:60].replace(
+                        "\n", " "
+                    )
+                    self.report.append(
+                        f"| {item.get('blocked_pid', 'N/A')} | {item.get('blocked_user', 'N/A')} | `{blocked_query}` | "
+                        f"{item.get('blocking_pid', 'N/A')} | {item.get('blocking_user', 'N/A')} | {item.get('blocked_mode', 'N/A')} | {item.get('blocked_relation', 'N/A')} |"
+                    )
+            else:
+                self.report.append("### ✅ OK: No Lock Waiters Detected")
+
+    def run_checks(self):
+        """
+        Run a predefined sequence of checks.
+        """
+        print("Starting comprehensive PostgreSQL health check...")
+
+        # Define the checklist of skills to run, ordered by importance
+        checklist = [
+            "get_invalid_indexes",
+            "get_xid_wraparound_risk",
+            "get_freeze_prediction",
+            "get_blocking_locks",
+            "get_long_running_prepared_transactions",
+            "get_long_running_transactions",
+            "get_critical_settings",
+            "get_sequence_exhaustion",
+            "get_replication_slots",
+            "get_wal_archiver_status",
+            "get_logical_replication_status",
+            "get_replication_status",
+            "get_wait_events",
+            "get_long_running_queries",
+            "get_idle_in_transaction_sessions",
+            "get_connection_usage",
+            "get_cache_hit_rate",
+            "get_rollback_rate",
+            "get_top_sql_by_time",
+            "get_stale_statistics",
+            "get_autovacuum_status",
+            "get_bgwriter_stats",
+            "get_temp_file_usage",
+            "get_io_statistics",
+            "get_deadlock_detection",
+            "get_lock_waiters",
+            "get_table_hotspots",
+            "get_top_objects_by_size",
+            "get_table_bloat",
+            "get_index_bloat",
+            "get_database_sizes",
+        ]
+
+        for skill in checklist:
+            print(f"  -> Running skill: {skill}...")
+            result = self._run_skill(skill)
+            self._analyze_and_report(result)
+            self.report.append("\n---\n")  # Separator
+
+        print("Checks complete. Generating report...")
+        self.generate_report()
+
+    def generate_report(self):
+        """
+        Generates the final markdown report.
+        """
+        report_title = f"# PostgreSQL Health Report - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        overall_status = f"## Overall Status: {self.report_status}"
+
+        # Clean up extra separators
+        while self.report and self.report[-1] == "\n---\n":
+            self.report.pop()
+
+        report_content = "\n".join([report_title, overall_status, *self.report])
+
+        report_filename = "daily_health_report.md"
+        with open(report_filename, "w", encoding="utf-8") as f:
+            f.write(report_content)
+
+        print(f"Report saved to: {report_filename}")
+
+
+if __name__ == "__main__":
+    agent = PostgresAgent()
+    agent.run_checks()
