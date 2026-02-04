@@ -527,11 +527,10 @@ function get_logical_replication_status() {
         SELECT
             subname,
             subid,
-            -- pg_wal_lsn_diff(pg_current_wal_lsn(), latest_commit_lsn) AS apply_lag_bytes, -- Removed due to column not existing in all versions
             EXTRACT(EPOCH FROM (now() - last_msg_send_time)) AS send_lag_sec,
             EXTRACT(EPOCH FROM (now() - last_msg_receipt_time)) AS receive_lag_sec
         FROM pg_stat_subscription
-        WHERE subid IS NOT NULL -- To ensure we only get active subscriptions
+        WHERE subid IS NOT NULL
         ORDER BY subname
     ) t;
 EOF
@@ -781,8 +780,8 @@ function get_stale_statistics() {
             (n_mod_since_analyze::numeric / GREATEST(n_live_tup, 1) * 100)::numeric(10,2) AS modified_percent
         FROM pg_stat_user_tables
         WHERE
-            n_live_tup > 1000 AND -- Only for tables with a decent number of rows
-            (n_mod_since_analyze::numeric / GREATEST(n_live_tup, 1)) > 0.10 -- >10% modified
+            n_live_tup > 1000 AND
+            (n_mod_since_analyze::numeric / GREATEST(n_live_tup, 1)) > 0.10
         ORDER BY modified_percent DESC
         LIMIT 10
     ) t;
@@ -838,6 +837,276 @@ function get_temp_file_usage() {
         WHERE temp_files > 0
         ORDER BY temp_bytes DESC
         LIMIT 10
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_io_statistics() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_io_statistics',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            datname,
+            temp_files,
+            temp_bytes,
+            pg_size_pretty(temp_bytes) as temp_bytes_pretty,
+            blks_read,
+            blks_hit,
+            blks_read + blks_hit as total_blks,
+            blk_read_time,
+            blk_write_time
+        FROM pg_stat_database
+        WHERE datname = current_database()
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_analyze_progress() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_analyze_progress',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            p.pid,
+            d.datname,
+            c.relname,
+            p.phase,
+            p.sample_blks_total,
+            p.sample_blks_scanned,
+            ROUND((p.sample_blks_scanned::numeric / NULLIF(p.sample_blks_total, 0) * 100), 2) AS scan_progress_pct,
+            p.child_tables_total,
+            p.child_tables_done,
+            p.delay_time
+        FROM pg_stat_progress_analyze p
+        JOIN pg_database d ON p.datid = d.oid
+        LEFT JOIN pg_class c ON p.relid = c.oid
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_create_index_progress() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_create_index_progress',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            p.pid,
+            d.datname,
+            c.relname AS table_name,
+            i.relname AS index_name,
+            p.command,
+            p.phase,
+            p.blocks_total,
+            p.blocks_done,
+            p.tuples_total,
+            p.tuples_done,
+            p.partitions_total,
+            p.partitions_done
+        FROM pg_stat_progress_create_index p
+        JOIN pg_database d ON p.datid = d.oid
+        LEFT JOIN pg_class c ON p.relid = c.oid
+        LEFT JOIN pg_class i ON p.index_relid = i.oid
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_cluster_progress() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_cluster_progress',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            p.pid,
+            d.datname,
+            c.relname,
+            p.command,
+            p.phase,
+            p.heap_blks_total,
+            p.heap_tuples_scanned,
+            p.heap_tuples_written,
+            p.cluster_index_relid
+        FROM pg_stat_progress_cluster p
+        JOIN pg_database d ON p.datid = d.oid
+        LEFT JOIN pg_class c ON p.relid = c.oid
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_wal_statistics() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_wal_statistics',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            wal_records,
+            wal_fpi,
+            wal_bytes,
+            pg_size_pretty(wal_bytes) AS wal_bytes_pretty,
+            wal_buffers_full
+        FROM pg_stat_wal
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_checkpointer_stats() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_checkpointer_stats',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            num_timed,
+            num_requested,
+            num_done,
+            write_time,
+            sync_time,
+            buffers_written,
+            slru_written
+        FROM pg_stat_checkpointer
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_slru_stats() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_slru_stats',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            name,
+            blks_zeroed,
+            blks_hit,
+            blks_read,
+            blks_written,
+            blks_exists,
+            flushes,
+            truncates
+        FROM pg_stat_slru
+        WHERE blks_read > 0 OR blks_written > 0 OR flushes > 0
+        ORDER BY blks_read DESC
+        LIMIT 10
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_database_conflict_stats() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_database_conflict_stats',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            d.datname,
+            c.confl_tablespace,
+            c.confl_lock,
+            c.confl_snapshot,
+            c.confl_bufferpin,
+            c.confl_deadlock,
+            c.confl_active_logicalslot
+        FROM pg_stat_database_conflicts c
+        JOIN pg_database d ON c.datid = d.oid
+        WHERE c.confl_tablespace + c.confl_lock + c.confl_snapshot + c.confl_bufferpin + c.confl_deadlock > 0
+        ORDER BY (c.confl_tablespace + c.confl_lock + c.confl_snapshot + c.confl_bufferpin + c.confl_deadlock) DESC
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_user_function_stats() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_user_function_stats',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            funcid,
+            schemaname,
+            funcname,
+            calls,
+            total_time,
+            self_time,
+            ROUND((total_time / NULLIF(calls, 0))::numeric, 2) AS avg_time_ms
+        FROM pg_stat_user_functions
+        WHERE calls > 0
+        ORDER BY total_time DESC
+        LIMIT 10
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_io_statistics_v2() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_io_statistics_v2',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            backend_type,
+            object,
+            context,
+            reads,
+            read_bytes,
+            pg_size_pretty(read_bytes) AS read_bytes_pretty,
+            writes,
+            write_bytes,
+            pg_size_pretty(write_bytes) AS write_bytes_pretty,
+            extends,
+            extend_bytes,
+            pg_size_pretty(extend_bytes) AS extend_bytes_pretty,
+            hits,
+            evictions,
+            reuses,
+            fsyncs,
+            fsync_time
+        FROM pg_stat_io
+        WHERE backend_type IS NOT NULL
+        ORDER BY (reads + writes) DESC
     ) t;
 EOF
 )
@@ -1024,7 +1293,6 @@ case "$SKILL_NAME" in
     get_freeze_prediction)
         get_freeze_prediction
         ;; 
-    # New skills
     get_wait_events)
         get_wait_events
         ;;
@@ -1037,17 +1305,44 @@ case "$SKILL_NAME" in
     get_sequence_exhaustion)
         get_sequence_exhaustion
         ;;
-    get_bgwriter_stats)
-        get_bgwriter_stats
-        ;;
     get_temp_file_usage)
         get_temp_file_usage
+        ;;
+    get_io_statistics)
+        get_io_statistics
+        ;;
+    get_analyze_progress)
+        get_analyze_progress
+        ;;
+    get_create_index_progress)
+        get_create_index_progress
+        ;;
+    get_cluster_progress)
+        get_cluster_progress
+        ;;
+    get_wal_statistics)
+        get_wal_statistics
+        ;;
+    get_checkpointer_stats)
+        get_checkpointer_stats
+        ;;
+    get_slru_stats)
+        get_slru_stats
+        ;;
+    get_database_conflict_stats)
+        get_database_conflict_stats
+        ;;
+    get_user_function_stats)
+        get_user_function_stats
+        ;;
+    get_io_statistics_v2)
+        get_io_statistics_v2
         ;;
     get_long_running_transactions)
         get_long_running_transactions "$2"
         ;;
-    get_io_statistics)
-        get_io_statistics
+    get_bgwriter_stats)
+        get_bgwriter_stats
         ;;
     get_deadlock_detection)
         get_deadlock_detection
@@ -1055,11 +1350,10 @@ case "$SKILL_NAME" in
     get_lock_waiters)
         get_lock_waiters
         ;;
-    get_bgwriter_stats)
-        get_bgwriter_stats
-        ;;
     *)
         echo "{\"skill\": \"$SKILL_NAME\", \"status\": \"fail\", \"data\": \"Unknown skill.\"}"
         exit 1
         ;;
 esac
+
+exit 0
