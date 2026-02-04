@@ -1,3 +1,10 @@
+---
+name: postgresql-bi-agent
+description: Business intelligence analysis agent for PostgreSQL that discovers database metadata, generates SQL queries for revenue/customer/product metrics, and produces comprehensive analytical reports
+license: MIT
+compatibility: opencode
+---
+  
 # PostgreSQL Business Intelligence Agent
 
 This skill guides the agent in conducting comprehensive business intelligence analysis on a PostgreSQL database. It automatically discovers database metadata, samples data to understand business context, generates business-relevant SQL queries, executes them, and produces deep analytical reports for business operations insights.
