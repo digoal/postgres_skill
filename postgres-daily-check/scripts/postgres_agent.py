@@ -24,6 +24,7 @@ class PostgresAgent:
         self.executor_script = os.path.join(os.path.dirname(__file__), executor_script)
         self.report = []
         self.report_status = "✅ OK"
+        self.raw_results = {}  # Store raw SQL results
 
     def _bytes_to_human_readable(self, num_bytes):
         """Converts bytes to human-readable format (e.g., KB, MB, GB)."""
@@ -911,6 +912,205 @@ class PostgresAgent:
             else:
                 self.report.append("### ✅ OK: No Lock Waiters Detected")
 
+        elif skill == "get_multixid_wraparound_risk":
+            self.report.append("### 🟡 INFO: MultiXactId Wraparound Risk")
+            has_risk = False
+            if data:
+                for db in data:
+                    status = db.get("status", "OK")
+                    datname = db.get("datname", "N/A")
+                    mxid_age = db.get("mxid_age", 0)
+                    remaining = db.get("remaining_to_autovacuum")
+                    
+                    if status == "INVALID_OR_FROZEN":
+                        self.report.append(
+                            f"- **{datname}**: ✅ **FROZEN/INVALID** - datminmxid is frozen or invalid (no risk)"
+                        )
+                    elif status == "FROZEN":
+                        self.report.append(
+                            f"- **{datname}**: ✅ **FROZEN** - MultiXactIds are frozen (no risk)"
+                        )
+                    elif status == "FORCE_AUTOVACUUM":
+                        self.report.append(
+                            f"- **{datname}**: 🟠 **FORCE AUTOVACUUM** - Autovacuum will be forced ({remaining:,} remaining)"
+                        )
+                        has_risk = True
+                        self._update_status("🟠 WARNING")
+                    elif status == "CRITICAL":
+                        self.report.append(
+                            f"- **{datname}**: ❌ **CRITICAL** - Approaching wraparound ({mxid_age:,} age)"
+                        )
+                        has_risk = True
+                        self._update_status("❌ ERROR")
+                    elif status == "WARNING":
+                        self.report.append(
+                            f"- **{datname}**: 🟠 **WARNING** - Getting close to wraparound ({mxid_age:,} age)"
+                        )
+                        has_risk = True
+                        self._update_status("🟠 WARNING")
+                    else:
+                        self.report.append(
+                            f"- **{datname}**: ✅ **OK** - {remaining:,} MultiXactIds remaining before forced autovacuum"
+                        )
+            if not has_risk:
+                self.report.append("All databases are well below the MultiXactId wraparound threshold.")
+
+        elif skill == "get_connection_security_status":
+            self.report.append("### 🟡 INFO: Connection Security Status (SSL/GSSAPI)")
+            if data:
+                unencrypted = [d for d in data if d.get("connection_type") == "unencrypted"]
+                ssl_count = len([d for d in data if d.get("ssl_enabled") == True])
+                gssapi_count = len([d for d in data if d.get("gssapi_encryption") == True])
+                local_count = len([d for d in data if d.get("connection_type") == "local"])
+                
+                self.report.append(f"- **SSL Encrypted:** {ssl_count} connections")
+                self.report.append(f"- **GSSAPI Encrypted:** {gssapi_count} connections")
+                self.report.append(f"- **Local (Unix Socket):** {local_count} connections")
+                self.report.append(f"- **Unencrypted (TCP):** {len(unencrypted)} connections")
+                
+                if unencrypted:
+                    self.report.append("### 🟠 WARNING: Unencrypted Remote Connections Detected")
+                    self.report.append("The following connections are not encrypted:")
+                    self.report.append("| Database | User | Client Address | Connection Type |")
+                    self.report.append("|---|---|---|---|")
+                    for conn in unencrypted[:10]:  # Show first 10
+                        self.report.append(
+                            f"| {conn.get('datname', 'N/A')} | {conn.get('usename', 'N/A')} | "
+                            f"{conn.get('client_addr', 'N/A')} | {conn.get('connection_type', 'N/A')} |"
+                        )
+                    self._update_status("🟠 WARNING")
+            else:
+                self.report.append("No connection security data available.")
+
+        elif skill == "get_total_temp_bytes":
+            self.report.append("### 🟡 INFO: Total Temp Bytes Usage")
+            if data:
+                total_gb = sum(float(item.get("temp_bytes_gb", 0)) for item in data)
+                self.report.append(f"**Total Temp Space Used:** {total_gb:.2f} GB")
+                self.report.append("")
+                self.report.append("| Database | Temp Files | Temp Size |")
+                self.report.append("|---|---|---|")
+                for item in data:
+                    self.report.append(
+                        f"| {item.get('datname', 'N/A')} | {item.get('temp_files', 0):,} | "
+                        f"{item.get('temp_bytes_pretty', 'N/A')} |"
+                    )
+                if total_gb > 10:  # More than 10GB
+                    self.report.append("### 🟠 WARNING: High Temporary File Usage")
+                    self.report.append("Large temporary file usage may indicate insufficient work_mem or inefficient queries.")
+                    self._update_status("🟠 WARNING")
+            else:
+                self.report.append("No databases exceed the temp bytes threshold.")
+
+        elif skill == "get_checkpointer_write_sync_time":
+            self.report.append("### 🟡 INFO: Checkpointer Write/Sync Time Analysis")
+            if data:
+                cp = data[0]
+                write_time = cp.get("write_time_ms", 0)
+                sync_time = cp.get("sync_time_ms", 0)
+                avg_write = cp.get("avg_write_time_per_checkpoint_ms", 0)
+                avg_sync = cp.get("avg_sync_time_per_checkpoint_ms", 0)
+                num_timed = cp.get("num_timed", 0)
+                num_requested = cp.get("num_requested", 0)
+                status = cp.get("checkpointer_status", "OK")
+                
+                self.report.append(f"- **Total Write Time:** {write_time:,.2f} ms")
+                self.report.append(f"- **Total Sync Time:** {sync_time:,.2f} ms")
+                self.report.append(f"- **Avg Write per Checkpoint:** {avg_write:,.2f} ms")
+                self.report.append(f"- **Avg Sync per Checkpoint:** {avg_sync:,.2f} ms")
+                self.report.append(f"- **Timed Checkpoints:** {num_timed}")
+                self.report.append(f"- **Requested Checkpoints:** {num_requested}")
+                
+                if status == "WARNING":
+                    if num_requested > num_timed * 2:
+                        self.report.append("### 🟠 WARNING: High Requested Checkpoint Ratio")
+                        self.report.append("Too many requested checkpoints vs timed checkpoints. Consider increasing max_wal_size.")
+                        self._update_status("🟠 WARNING")
+                    if avg_write > 5000 or avg_sync > 5000:
+                        self.report.append("### 🟠 WARNING: High Checkpoint I/O Time")
+                        self.report.append("Average checkpoint write/sync time is high. Consider faster storage or checkpoint tuning.")
+                        self._update_status("🟠 WARNING")
+            else:
+                self.report.append("Unable to retrieve checkpointer statistics.")
+
+        elif skill == "get_logical_replication_status":
+            self.report.append("### 🟡 INFO: Logical Replication Status")
+            if data:
+                has_lag = False
+                self.report.append("| Subscription | Send Lag (sec) | Receive Lag (sec) |")
+                self.report.append("|---|---|---|")
+                for item in data:
+                    send_lag = item.get("send_lag_sec", 0)
+                    recv_lag = item.get("receive_lag_sec", 0)
+                    self.report.append(
+                        f"| {item.get('subname', 'N/A')} | {send_lag:.2f} | {recv_lag:.2f} |"
+                    )
+                    if send_lag > 300 or recv_lag > 300:  # > 5 minutes
+                        has_lag = True
+                if has_lag:
+                    self.report.append("### 🟠 WARNING: Logical Replication Lag Detected")
+                    self.report.append("Replication lag exceeds 5 minutes. Check network or subscriber performance.")
+                    self._update_status("🟠 WARNING")
+            else:
+                self.report.append("No logical replication subscriptions found.")
+
+        elif skill == "get_long_running_prepared_transactions":
+            self.report.append("### 🟡 INFO: Long-Running Prepared Transactions (2PC)")
+            if data:
+                self.report.append("### 🟠 WARNING: Long-Running Prepared Transactions Detected")
+                self.report.append(
+                    f"Found {len(data)} prepared transactions older than threshold. These hold locks and prevent WAL cleanup."
+                )
+                self.report.append("| GID | Owner | Database | Duration |")
+                self.report.append("|---|---|---|---|")
+                for item in data:
+                    self.report.append(
+                        f"| {item.get('gid', 'N/A')} | {item.get('owner', 'N/A')} | "
+                        f"{item.get('database', 'N/A')} | {item.get('duration', 'N/A')} |"
+                    )
+                self._update_status("🟠 WARNING")
+            else:
+                self.report.append("### ✅ OK: No Long-Running Prepared Transactions")
+
+        elif skill == "get_long_running_transactions":
+            self.report.append("### 🟡 INFO: Long-Running Transactions")
+            if data:
+                self.report.append("### 🟠 WARNING: Long-Running Transactions Detected")
+                self.report.append(
+                    f"Found {len(data)} transactions running longer than threshold. These may hold locks and prevent vacuum."
+                )
+                self.report.append("| PID | User | Database | Duration | State |")
+                self.report.append("|---|---|---|---|---|")
+                for item in data:
+                    query_text = str(item.get("query", ""))[:50].replace("\n", " ")
+                    self.report.append(
+                        f"| {item.get('pid', 'N/A')} | {item.get('usename', 'N/A')} | "
+                        f"{item.get('datname', 'N/A')} | {item.get('transaction_duration', 'N/A')} | "
+                        f"{item.get('state', 'N/A')} |"
+                    )
+                self._update_status("🟠 WARNING")
+            else:
+                self.report.append("### ✅ OK: No Long-Running Transactions")
+
+        elif skill == "get_temp_file_usage":
+            self.report.append("### 🟡 INFO: Temporary File Usage by Database")
+            if data:
+                self.report.append("| Database | Temp Files | Temp Size | Temp Files Ratio |")
+                self.report.append("|---|---|---|---|")
+                for item in data:
+                    self.report.append(
+                        f"| {item.get('datname', 'N/A')} | {item.get('temp_files', 0):,} | "
+                        f"{item.get('temp_bytes_pretty', 'N/A')} | {item.get('temp_files_ratio', 0):.2%} |"
+                    )
+                total_temp_files = sum(item.get("temp_files", 0) for item in data)
+                if total_temp_files > 100:
+                    self.report.append(f"\n**Total Temp Files:** {total_temp_files:,}")
+                    self.report.append("### 🟠 WARNING: High Temporary File Count")
+                    self.report.append("High temp file usage may indicate inefficient queries or insufficient work_mem.")
+                    self._update_status("🟠 WARNING")
+            else:
+                self.report.append("No temporary file usage detected.")
+
     def run_checks(self):
         """
         Run a predefined sequence of checks.
@@ -921,6 +1121,7 @@ class PostgresAgent:
         checklist = [
             "get_invalid_indexes",
             "get_xid_wraparound_risk",
+            "get_multixid_wraparound_risk",
             "get_freeze_prediction",
             "get_blocking_locks",
             "get_long_running_prepared_transactions",
@@ -939,9 +1140,11 @@ class PostgresAgent:
             "get_rollback_rate",
             "get_top_sql_by_time",
             "get_stale_statistics",
+            "get_large_unused_indexes",
             "get_autovacuum_status",
             "get_bgwriter_stats",
             "get_temp_file_usage",
+            "get_total_temp_bytes",
             "get_io_statistics",
             "get_io_statistics_v2",
             "get_analyze_progress",
@@ -949,11 +1152,13 @@ class PostgresAgent:
             "get_cluster_progress",
             "get_wal_statistics",
             "get_checkpointer_stats",
+            "get_checkpointer_write_sync_time",
             "get_slru_stats",
             "get_database_conflict_stats",
             "get_user_function_stats",
             "get_deadlock_detection",
             "get_lock_waiters",
+            "get_connection_security_status",
             "get_table_hotspots",
             "get_top_objects_by_size",
             "get_table_bloat",
@@ -964,6 +1169,7 @@ class PostgresAgent:
         for skill in checklist:
             print(f"  -> Running skill: {skill}...")
             result = self._run_skill(skill)
+            self.raw_results[skill] = result  # Store raw result
             self._analyze_and_report(result)
             self.report.append("\n---\n")  # Separator
 
@@ -972,7 +1178,7 @@ class PostgresAgent:
 
     def generate_report(self):
         """
-        Generates the final markdown report.
+        Generates the final markdown report and raw JSON data.
         """
         report_title = f"# PostgreSQL Health Report - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         overall_status = f"## Overall Status: {self.report_status}"
@@ -983,11 +1189,24 @@ class PostgresAgent:
 
         report_content = "\n".join([report_title, overall_status, *self.report])
 
+        # Save markdown report
         report_filename = "daily_health_report.md"
         with open(report_filename, "w", encoding="utf-8") as f:
             f.write(report_content)
 
         print(f"Report saved to: {report_filename}")
+
+        # Save raw JSON results
+        raw_data_filename = "daily_health_raw_data.json"
+        raw_data = {
+            "generated_at": datetime.datetime.now().isoformat(),
+            "overall_status": self.report_status,
+            "results": self.raw_results
+        }
+        with open(raw_data_filename, "w", encoding="utf-8") as f:
+            json.dump(raw_data, f, indent=2, ensure_ascii=False, default=str)
+
+        print(f"Raw data saved to: {raw_data_filename}")
 
 
 if __name__ == "__main__":
