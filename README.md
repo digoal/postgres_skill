@@ -7,11 +7,13 @@ PostgreSQL SKILLs for AI Agent.
   
 [Powered by AI](https://github.com/digoal/blog/blob/master/202602/20260204_01.md) 
   
-用法: 将对应 skill 目录拷贝到AI Agent指定的存放SKILL的目录中.  
+-----  
   
-发起巡检请求, 例如: `全面巡检 postgresql 数据库, 连接: host 127.0.0.1 port 1922 user digoal dbname postgres password 123456`  
+用法: 将对应 skill 目录拷贝到 AI Agent 指定的存放 SKILL 的目录中.  
+  
+发起巡检请求, 例如使用 postgres-daily-check 技能: `全面巡检 postgresql 数据库, 连接: host 127.0.0.1 port 1922 user digoal dbname postgres password 123456`  
     
-postgres-daily-check 技能的 PostgreSQL 巡检结果展示举例:   
+postgres-daily-check 技能的 PostgreSQL 巡检结果展示:   
   
 🔍 PostgreSQL 全面巡检报告  
   
