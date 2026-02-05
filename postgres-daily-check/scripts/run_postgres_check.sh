@@ -554,10 +554,14 @@ function get_table_bloat() {
                 c.relpages,
                 n.nspname,
                 c.relname,
-                COALESCE(s.avg_width, 32) AS avg_row_width
+                COALESCE((
+                    SELECT AVG(s.avg_width)
+                    FROM pg_stats s
+                    WHERE s.schemaname = n.nspname
+                      AND s.tablename = c.relname
+                ), 32) AS avg_row_width
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            LEFT JOIN pg_stats s ON n.nspname = s.schemaname AND c.relname = s.tablename
             WHERE c.relkind = 'r'
               AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
               AND c.relpages > 100
@@ -1179,6 +1183,138 @@ EOF
     execute_sql_as_json "$query"
 }
 
+function get_multixid_wraparound_risk() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_multixid_wraparound_risk',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            d.datname,
+            age(d.datminmxid) AS mxid_age,
+            d.datminmxid,
+            current_setting('autovacuum_multixact_freeze_max_age')::bigint AS freeze_max_age,
+            CASE
+                WHEN d.datminmxid = 0 THEN 'FROZEN'
+                WHEN age(d.datminmxid) >= 2147483647 THEN 'INVALID_OR_FROZEN'
+                WHEN age(d.datminmxid) >= current_setting('autovacuum_multixact_freeze_max_age')::bigint THEN 'FORCE_AUTOVACUUM'
+                WHEN age(d.datminmxid) >= 2107483647 THEN 'CRITICAL'
+                WHEN age(d.datminmxid) >= 2117483647 THEN 'WARNING'
+                ELSE 'OK'
+            END AS status,
+            CASE
+                WHEN d.datminmxid = 0 THEN NULL
+                WHEN age(d.datminmxid) >= 2147483647 THEN NULL
+                ELSE (current_setting('autovacuum_multixact_freeze_max_age')::bigint - age(d.datminmxid))
+            END AS remaining_to_autovacuum
+        FROM
+            pg_database d
+        WHERE
+            d.datallowconn = true
+        ORDER BY
+            mxid_age DESC
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_connection_security_status() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_connection_security_status',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            a.datname,
+            a.usename,
+            a.client_addr,
+            COALESCE(s.ssl, false) AS ssl_enabled,
+            COALESCE(s.version, 'N/A') AS ssl_version,
+            COALESCE(s.cipher, 'N/A') AS ssl_cipher,
+            COALESCE(g.gss_authenticated, false) AS gssapi_auth,
+            COALESCE(g.encrypted, false) AS gssapi_encryption,
+            CASE
+                WHEN s.ssl = true THEN 'SSL'
+                WHEN g.encrypted = true THEN 'GSSAPI'
+                WHEN a.client_addr IS NULL THEN 'local'
+                ELSE 'unencrypted'
+            END AS connection_type
+        FROM pg_stat_activity a
+        LEFT JOIN pg_stat_ssl s ON a.pid = s.pid
+        LEFT JOIN pg_stat_gssapi g ON a.pid = g.pid
+        WHERE a.backend_type = 'client backend'
+        ORDER BY connection_type, a.datname, a.usename
+        LIMIT 50
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_total_temp_bytes() {
+    local threshold_gb=${1:-1}  # Default threshold 1GB
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_total_temp_bytes',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            datname,
+            temp_files,
+            temp_bytes,
+            pg_size_pretty(temp_bytes) AS temp_bytes_pretty,
+            (temp_bytes / (1024.0 * 1024 * 1024))::numeric(10,2) AS temp_bytes_gb
+        FROM pg_stat_database
+        WHERE temp_bytes > (${threshold_gb} * 1024 * 1024 * 1024)
+        ORDER BY temp_bytes DESC
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
+function get_checkpointer_write_sync_time() {
+    local query=$(cat <<EOF
+    SELECT json_build_object(
+        'skill', 'get_checkpointer_write_sync_time',
+        'status', 'success',
+        'data', COALESCE(json_agg(t), '[]'::json)
+    )
+    FROM (
+        SELECT
+            num_timed,
+            num_requested,
+            num_done,
+            ROUND(write_time::numeric, 2) AS write_time_ms,
+            ROUND(sync_time::numeric, 2) AS sync_time_ms,
+            buffers_written,
+            CASE
+                WHEN num_done > 0 THEN ROUND((write_time / num_done)::numeric, 2)
+                ELSE 0
+            END AS avg_write_time_per_checkpoint_ms,
+            CASE
+                WHEN num_done > 0 THEN ROUND((sync_time / num_done)::numeric, 2)
+                ELSE 0
+            END AS avg_sync_time_per_checkpoint_ms,
+            CASE
+                WHEN num_timed > 0 AND num_requested > num_timed * 2 THEN 'WARNING'
+                WHEN write_time > 10000 OR sync_time > 10000 THEN 'WARNING'
+                ELSE 'OK'
+            END AS checkpointer_status
+        FROM pg_stat_checkpointer
+    ) t;
+EOF
+)
+    execute_sql_as_json "$query"
+}
+
 function get_lock_waiters() {
     local query=$(cat <<EOF
     SELECT json_build_object(
@@ -1349,6 +1485,18 @@ case "$SKILL_NAME" in
         ;;
     get_lock_waiters)
         get_lock_waiters
+        ;;
+    get_multixid_wraparound_risk)
+        get_multixid_wraparound_risk
+        ;;
+    get_connection_security_status)
+        get_connection_security_status
+        ;;
+    get_total_temp_bytes)
+        get_total_temp_bytes "$2"
+        ;;
+    get_checkpointer_write_sync_time)
+        get_checkpointer_write_sync_time
         ;;
     *)
         echo "{\"skill\": \"$SKILL_NAME\", \"status\": \"fail\", \"data\": \"Unknown skill.\"}"
