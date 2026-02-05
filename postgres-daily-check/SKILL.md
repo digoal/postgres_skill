@@ -21,14 +21,36 @@ The primary goal of this skill is to empower the agent to proactively monitor th
 
 The agent performs checks across several key areas:
 
-*   **Availability & Health**: Verifying database responsiveness and detecting critical errors like invalid indexes or XID wraparound risks.
-*   **Performance & Activity**: Monitoring active sessions, long-running queries, cache efficiency, transaction rollback rates, and identifying application hotspots.
+*   **Availability & Health**: Verifying database responsiveness and detecting critical errors like invalid indexes, XID/MultiXactId wraparound risks, and deadlock occurrences.
+*   **Performance & Activity**: Monitoring active sessions, long-running queries, cache efficiency, transaction rollback rates, identifying application hotspots, and tracking temporary file usage.
+*   **Security**: Checking connection encryption status (SSL/GSSAPI) to ensure data transmission security.
 *   **Replication & Archiving**: Ensuring data consistency and recoverability by checking replication lag, slot status, and WAL archiving health.
-*   **Maintenance & Storage**: Analyzing disk usage, identifying bloat in tables and indexes, and checking autovacuum activity.
+*   **Maintenance & Storage**: Analyzing disk usage, identifying bloat in tables and indexes, checking autovacuum activity, and monitoring sequence exhaustion.
 
 ## Workflow
 
 When activated, this skill executes a predefined sequence of checks. Each check involves calling a specialized script (`run_postgres_check.sh`) which executes specific SQL queries against the target PostgreSQL database. The results are then analyzed by the agent, and a comprehensive Markdown report is generated.
+
+## Warning Strategy Guidelines
+
+The default warning thresholds are designed for general-purpose use. You should adjust them based on your specific workload characteristics:
+
+### OLTP Systems (Low Latency Required)
+- **Long-running queries**: Set threshold to 1 minute or less
+- **Cache hit rate**: Target >99%, warning at <97%
+- **Connection usage**: More aggressive thresholds (WARNING at >70%, ERROR at >90%)
+
+### Analytical/Reporting Systems
+- **Long-running queries**: Higher thresholds acceptable (10-30 minutes)
+- **Cache hit rate**: Lower hit rates expected due to large scans (warning at <90%)
+- **Temp file usage**: Higher tolerance for temporary files
+
+### General Recommendations
+- **bgwriter maxwritten_clean**: Monitor trends over time rather than single values
+- **Checkpointer stats**: Focus on average write/sync times per checkpoint rather than totals
+- **XID/MultiXactId wraparound**: Always maintain conservative thresholds regardless of workload
+
+All thresholds in `postgres_agent.py` can be customized by modifying the analysis logic.
 
 ## Available Skills
 
@@ -69,6 +91,35 @@ Each item below represents a callable skill within the `run_postgres_check.sh` s
     }
     ```
 -   **Analysis**: Reports CRITICAL ERROR if XID age >85%, WARNING if >70%.
+
+### Skill: `get_multixid_wraparound_risk`
+
+-   **Description**: Monitors the age of MultiXactId (multi-transaction IDs) for each database. Similar to XID wraparound, MultiXactId wraparound can also lead to data loss and requires monitoring. **Note**: `age(datminmxid) = 2147483647` (INT_MAX) indicates the MultiXactId is frozen or invalid, which is normal and not a risk.
+-   **Usage**: `./run_postgres_check.sh get_multixid_wraparound_risk`
+-   **Expected Output**:
+    ```json
+    {
+      "skill": "get_multixid_wraparound_risk",
+      "status": "success",
+      "data": [
+        {
+          "datname": "postgres",
+          "mxid_age": 1234567,
+          "datminmxid": 12345,
+          "freeze_max_age": 400000000,
+          "status": "OK",
+          "remaining_to_autovacuum": 398765433
+        }
+      ]
+    }
+    ```
+-   **Analysis**: 
+    -   **FROZEN/INVALID**: `datminmxid = 0` or `age = INT_MAX` - MultiXactIds are frozen, no risk ✅
+    -   **OK**: More than 30M MultiXactIds remaining before forced autovacuum ✅
+    -   **WARNING**: Less than 40M remaining - Getting close to threshold 🟠
+    -   **CRITICAL**: Less than 3M remaining - Approaching wraparound ❌
+    -   **FORCE_AUTOVACUUM**: Age >= `autovacuum_multixact_freeze_max_age` - Autovacuum will be forced 🟠
+-   **Official Doc**: [PostgreSQL Routine Maintenance - Preventing Transaction ID Wraparound Failures](https://www.postgresql.org/docs/current/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND)
 
 ### Skill: `get_blocking_locks`
 
@@ -116,14 +167,32 @@ Each item below represents a callable skill within the `run_postgres_check.sh` s
     ```
 -   **Analysis**: Reports CRITICAL ERROR if fsync=off.
 
+### Skill: `get_connection_security_status`
+
+-   **Description**: Checks SSL/GSSAPI encryption status for active connections. Security audit to ensure connections use proper encryption.
+-   **Usage**: `./run_postgres_check.sh get_connection_security_status`
+-   **Expected Output**:
+    ```json
+    {
+      "skill": "get_connection_security_status",
+      "status": "success",
+      "data": [
+        {"datname": "postgres", "usename": "app_user", "ssl_enabled": true, "ssl_version": "TLSv1.3", "connection_type": "SSL"}
+      ]
+    }
+    ```
+-   **Analysis**: Reports WARNING if unencrypted remote TCP connections found. SSL or GSSAPI encryption recommended for production.
+-   **Official Doc**: [PostgreSQL SSL Support](https://www.postgresql.org/docs/current/ssl-tcp.html), [pg_stat_ssl](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-SSL), [pg_stat_gssapi](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-GSSAPI)
+
 ---
 
 ## 2. Session & Connection Monitoring
 
 ### Skill: `get_long_running_queries`
 
--   **Description**: Finds active queries running longer than threshold (default 5 minutes).
+-   **Description**: Finds active queries running longer than threshold (default 5 minutes for general use, 1 minute recommended for OLTP systems).
 -   **Usage**: `./run_postgres_check.sh get_long_running_queries [threshold_minutes]`
+-   **Parameters**: `threshold_minutes` - Threshold in minutes (default: 5)
 -   **Expected Output**:
     ```json
     {
@@ -134,7 +203,7 @@ Each item below represents a callable skill within the `run_postgres_check.sh` s
       ]
     }
     ```
--   **Analysis**: Reports WARNING if any long-running queries found.
+-   **Analysis**: Reports WARNING if any long-running queries found. For OLTP systems with strict response time requirements, consider setting threshold to 1 minute.
 
 ### Skill: `get_idle_in_transaction_sessions`
 
@@ -178,9 +247,10 @@ Each item below represents a callable skill within the `run_postgres_check.sh` s
 
 ### Skill: `get_cache_hit_rate`
 
--   **Description**: Calculates block cache hit rate. Low rate (<99%) indicates memory pressure or bad queries.
+-   **Description**: Calculates block cache hit rate. Low rate indicates memory pressure or bad queries. Threshold should be adjusted based on workload characteristics.
 -   **Usage**: `./run_postgres_check.sh get_cache_hit_rate`
--   **Analysis**: WARNING if hit rate <99%.
+-   **Analysis**: WARNING if hit rate <95%. For some workloads, 90% may be acceptable. OLTP systems should target >99%, while analytical workloads may have lower hit rates due to large table scans.
+-   **Note**: The 99% threshold may be too strict for certain workloads. Adjust based on your performance baseline.
 
 ### Skill: `get_rollback_rate`
 
@@ -205,13 +275,32 @@ Each item below represents a callable skill within the `run_postgres_check.sh` s
 
 -   **Description**: Background writer statistics and buffer allocation.
 -   **Usage**: `./run_postgres_check.sh get_bgwriter_stats`
--   **Analysis**: WARNING if maxwritten_clean > 0.
+-   **Analysis**: WARNING if maxwritten_clean remains high over time (persistent high values indicate bgwriter tuning issues). Occasional >0 values are normal. Consider monitoring the trend rather than single values.
+-   **Note**: maxwritten_clean indicates the number of times the background writer stopped a cleaning scan because it had written too many buffers. While this can indicate insufficient bgwriter capacity, occasional occurrences are normal and not necessarily a concern.
 
 ### Skill: `get_temp_file_usage`
 
 -   **Description**: Shows databases with temporary file usage.
 -   **Usage**: `./run_postgres_check.sh get_temp_file_usage`
 -   **Analysis**: Lists databases with temp file statistics.
+
+### Skill: `get_total_temp_bytes`
+
+-   **Description**: Shows databases with total temporary file bytes exceeding threshold. More accurate than file count for disk space impact assessment.
+-   **Usage**: `./run_postgres_check.sh get_total_temp_bytes [threshold_gb]`
+-   **Parameters**: `threshold_gb` - Minimum temp bytes in GB to report (default: 1GB)
+-   **Expected Output**:
+    ```json
+    {
+      "skill": "get_total_temp_bytes",
+      "status": "success",
+      "data": [
+        {"datname": "postgres", "temp_files": 150, "temp_bytes": 2147483648, "temp_bytes_gb": 2.0}
+      ]
+    }
+    ```
+-   **Analysis**: Reports WARNING if total temp space >10GB. High temp usage indicates insufficient work_mem or inefficient queries.
+-   **Official Doc**: [pg_stat_database](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-DATABASE)
 
 ### Skill: `get_io_statistics`
 
@@ -272,15 +361,9 @@ Each item below represents a callable skill within the `run_postgres_check.sh` s
     ```
 -   **Analysis**: WARNING if wal_buffers_full is high (consider increasing wal_buffers).
 
-### Skill: `get_checkpointer_stats`
-
--   **Description**: Reports checkpointer activity including timed vs requested checkpoints, I/O time, and buffers written.
--   **Usage**: `./run_postgres_check.sh get_checkpointer_stats`
--   **Analysis**: WARNING if requested checkpoints >> timed (tune max_wal_size) or high I/O time.
-
 ### Skill: `get_slru_stats`
 
--   **Description**: Reports SLRU (Simple Least-Recently-Used) cache statistics for internal subsystems like MultiXact, CommitTs.
+-   **Description**: Reports SLRU (Simple Least-Recently-Used) cache statistics for internal subsystems like MultiXact, CommitTs, Subtransaction, and Transaction managers. Low hit ratios may indicate undersized SLRU buffers.
 -   **Usage**: `./run_postgres_check.sh get_slru_stats`
 -   **Expected Output**:
     ```json
@@ -288,31 +371,122 @@ Each item below represents a callable skill within the `run_postgres_check.sh` s
       "skill": "get_slru_stats",
       "status": "success",
       "data": [
-        {"name": "multixact_offset", "blks_hit": 1000, "blks_read": 100, "hit_ratio": 90.9}
+        {"name": "transaction", "blks_hit": 84086814, "blks_read": 1768614, "hit_ratio": 97.94}
       ]
     }
     ```
--   **Analysis**: WARNING if hit ratio < 90% (consider tuning SLRU buffer sizes).
-
-### Skill: `get_database_conflict_stats`
-
--   **Description**: Reports query cancellations due to conflicts on standby servers (snapshot, lock, tablespace conflicts).
--   **Usage**: `./run_postgres_check.sh get_database_conflict_stats`
--   **Note**: Only applicable on standby servers.
--   **Analysis**: WARNING if any conflicts detected (tune max_standby_streaming_delay).
-
-### Skill: `get_user_function_stats`
-
--   **Description**: Reports user-defined function performance statistics (calls, total time, self time).
--   **Usage**: `./run_postgres_check.sh get_user_function_stats`
--   **Note**: Requires `track_functions = 'all'` in postgresql.conf.
--   **Analysis**: Lists top time-consuming functions for optimization opportunities.
+-   **Analysis**: WARNING if hit ratio < 90% and blks_read > 1000. Low hit ratios may require tuning SLRU buffer sizes via postgresql.conf.
+-   **Official Doc**: [pg_stat_slru](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-SLRU)
 
 ### Skill: `get_io_statistics_v2`
 
--   **Description**: Extended I/O statistics from `pg_stat_io` (PostgreSQL 16+), showing detailed read/write/extending statistics by backend type, object type, and context. Provides better visibility into I/O patterns.
+-   **Description**: Extended I/O statistics from `pg_stat_io` (PostgreSQL 16+), showing detailed read/write/extending statistics by backend type, object type, and context. Provides better visibility into I/O patterns than traditional pg_stat_database.
 -   **Usage**: `./run_postgres_check.sh get_io_statistics_v2`
--   **Analysis**: Reports I/O statistics by backend type and context. Useful for understanding I/O patterns and identifying performance bottlenecks.
+-   **Note**: Only available on PostgreSQL 16 and later. Falls back gracefully on older versions.
+-   **Expected Output**:
+    ```json
+    {
+      "skill": "get_io_statistics_v2",
+      "status": "success",
+      "data": [
+        {
+          "backend_type": "client backend",
+          "object": "relation",
+          "context": "normal",
+          "reads": 1000,
+          "read_bytes": 8192000,
+          "writes": 500,
+          "write_bytes": 4096000,
+          "hits": 50000
+        }
+      ]
+    }
+    ```
+-   **Analysis**: Reports I/O statistics by backend type and context. Useful for understanding I/O patterns, identifying which backend types are causing I/O, and pinpointing performance bottlenecks. Compare reads vs hits to assess cache efficiency per backend type.
+-   **Official Doc**: [pg_stat_io](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-IO)
+
+### Skill: `get_user_function_stats`
+
+-   **Description**: Reports user-defined function performance statistics including call counts, total execution time, and self time. Helps identify slow or frequently called functions that may need optimization.
+-   **Usage**: `./run_postgres_check.sh get_user_function_stats`
+-   **Note**: Requires `track_functions = 'all'` or `'pl'` in postgresql.conf. If disabled, no data will be available.
+-   **Expected Output**:
+    ```json
+    {
+      "skill": "get_user_function_stats",
+      "status": "success",
+      "data": [
+        {
+          "funcid": 16384,
+          "schemaname": "public",
+          "funcname": "my_function",
+          "calls": 1000,
+          "total_time": 5000.0,
+          "self_time": 3000.0,
+          "avg_time_ms": 5.0
+        }
+      ]
+    }
+    ```
+-   **Analysis**: Lists top time-consuming functions ordered by total_time. Functions with high total_time or high avg_time_ms are candidates for optimization. Consider function refactoring, better indexing, or query optimization.
+-   **Official Doc**: [pg_stat_user_functions](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-USER-FUNCTIONS)
+
+### Skill: `get_database_conflict_stats`
+
+-   **Description**: Reports query cancellations due to conflicts on standby servers. Conflicts occur when standby queries conflict with WAL replay operations (e.g., dropping a table being queried, tablespace changes, or snapshot conflicts).
+-   **Usage**: `./run_postgres_check.sh get_database_conflict_stats`
+-   **Note**: Only applicable on standby/replica servers. Will return empty on primary servers.
+-   **Expected Output**:
+    ```json
+    {
+      "skill": "get_database_conflict_stats",
+      "status": "success",
+      "data": [
+        {
+          "datname": "postgres",
+          "confl_tablespace": 0,
+          "confl_lock": 0,
+          "confl_snapshot": 5,
+          "confl_bufferpin": 0,
+          "confl_deadlock": 0,
+          "confl_active_logicalslot": 0
+        }
+      ]
+    }
+    ```
+-   **Analysis**: WARNING if any conflicts detected. High snapshot conflicts indicate standby queries running too long while WAL is being replayed. Consider tuning `max_standby_streaming_delay` or `hot_standby_feedback`. Lock conflicts may require shorter queries on standby.
+-   **Official Doc**: [pg_stat_database_conflicts](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-DATABASE-CONFLICTS)
+
+### Skill: `get_checkpointer_stats`
+
+-   **Description**: Reports checkpointer activity including timed vs requested checkpoints, I/O time, and buffers written.
+-   **Usage**: `./run_postgres_check.sh get_checkpointer_stats`
+-   **Analysis**: WARNING if requested checkpoints >> timed (tune max_wal_size) or high I/O time.
+
+### Skill: `get_checkpointer_write_sync_time`
+
+-   **Description**: Detailed analysis of checkpointer write and sync times to identify I/O bottlenecks. Calculates average times per checkpoint.
+-   **Usage**: `./run_postgres_check.sh get_checkpointer_write_sync_time`
+-   **Expected Output**:
+    ```json
+    {
+      "skill": "get_checkpointer_write_sync_time",
+      "status": "success",
+      "data": [
+        {
+          "num_timed": 100,
+          "num_requested": 50,
+          "write_time_ms": 5000.0,
+          "sync_time_ms": 2000.0,
+          "avg_write_time_per_checkpoint_ms": 33.33,
+          "avg_sync_time_per_checkpoint_ms": 13.33,
+          "checkpointer_status": "OK"
+        }
+      ]
+    }
+    ```
+-   **Analysis**: Reports WARNING if avg write/sync time per checkpoint >5000ms, or if requested checkpoints significantly exceed timed checkpoints. Helps identify storage I/O bottlenecks.
+-   **Official Doc**: [pg_stat_checkpointer](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-CHECKPOINTER)
 
 ---
 
@@ -456,9 +630,11 @@ The agent generates `daily_health_report.md` with:
 |------------|----------|-------------|
 | get_invalid_indexes | Availability | Check for corrupted indexes |
 | get_xid_wraparound_risk | Availability | Monitor transaction ID wraparound |
+| get_multixid_wraparound_risk | Availability | Monitor MultiXactId wraparound |
 | get_blocking_locks | Availability | Detect lock contention |
 | get_deadlock_detection | Availability | Check for past deadlocks |
 | get_critical_settings | Availability | Review critical parameters |
+| get_connection_security_status | Security | Check SSL/GSSAPI encryption status |
 | get_long_running_queries | Session | Find long-running queries |
 | get_idle_in_transaction_sessions | Session | Find idle-in-transaction sessions |
 | get_long_running_transactions | Session | Find long transactions |
@@ -472,6 +648,7 @@ The agent generates `daily_health_report.md` with:
 | get_table_hotspots | Performance | Most active tables |
 | get_bgwriter_stats | Performance | Background writer metrics |
 | get_temp_file_usage | Performance | Temporary file usage |
+| get_total_temp_bytes | Performance | Total temp file bytes by database |
 | get_io_statistics | Performance | I/O statistics and timing |
 | get_io_statistics_v2 | Performance | Extended I/O statistics (pg_stat_io) |
 | get_analyze_progress | Performance | ANALYZE progress monitoring |
@@ -479,6 +656,7 @@ The agent generates `daily_health_report.md` with:
 | get_cluster_progress | Performance | CLUSTER/VACUUM FULL progress |
 | get_wal_statistics | Performance | WAL activity statistics |
 | get_checkpointer_stats | Performance | Checkpointer activity |
+| get_checkpointer_write_sync_time | Performance | Checkpointer I/O time analysis |
 | get_slru_stats | Performance | SLRU cache statistics |
 | get_user_function_stats | Performance | UDF performance |
 | get_replication_slots | Replication | Replication slot status |
